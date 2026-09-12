@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>训练模型 - YOLO 学习平台</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f5f6fa; color: #222; }
+  header { background: #1a1c2e; color: #fff; padding: 12px 20px; display: flex;
+           justify-content: space-between; align-items: center; }
+  header a { color: #9db4ff; text-decoration: none; font-size: .9rem; }
+  main { max-width: 900px; margin: 0 auto; padding: 14px; }
+  section { background: #fff; border-radius: 12px; padding: 14px; margin-bottom: 14px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+  h2 { margin: 0 0 10px; font-size: 1rem; border-left: 4px solid #5b7cfa; padding-left: 8px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  button { background: #5b7cfa; color: #fff; border: 0; border-radius: 8px;
+           padding: 10px 18px; font-size: 1rem; cursor: pointer; }
+  button:disabled { background: #b9c1d4; }
+  button.red { background: #e05b5b; }
+  input, select { padding: 8px; border-radius: 8px; border: 1px solid #ccc; font-size: .95rem; }
+  #bar { height: 18px; background: #e8eaf2; border-radius: 10px; overflow: hidden; margin-top: 10px; }
+  #fill { height: 100%; width: 0; background: #38b26a; transition: width .5s; }
+  pre { background: #14161f; color: #cde3ff; padding: 12px; border-radius: 8px;
+        font-size: .78rem; overflow-x: auto; max-height: 320px; white-space: pre-wrap; }
+  .stat { font-size: .9rem; margin-top: 8px; }
+  .hint { font-size: .8rem; color: #999; }
+  img#curve { max-width: 100%; border-radius: 8px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<header><b>🏋️ 训练自定义模型</b><a href="/">← 返回首页</a></header>
+<main>
+
+  <section>
+    <h2>1️⃣ 数据概况</h2>
+    <div id="stats" class="stat">加载中...</div>
+    <p class="hint">训练前请先在<a href="/annotate">标注页面</a>上传并标注图片。建议每类至少 30 张,共 80% 用于训练、20% 验证。</p>
+  </section>
+
+  <section>
+    <h2>2️⃣ 训练参数</h2>
+    <div class="row">
+      <label>轮数 epochs <input id="epochs" type="number" value="30" min="1" style="width:70px"></label>
+      <label>图片尺寸 <select id="imgsz"><option>320</option><option selected>480</option><option>640</option></select></label>
+      <button id="start">▶ 开始训练(在电脑上运行)</button>
+      <button id="stop" class="red" style="display:none">■ 停止</button>
+    </div>
+    <p class="hint">CPU 训练较慢:100 张图、30 轮约需 20~40 分钟。训练期间可以离开这个页面,回来刷新即可看到进度。</p>
+    <div id="bar"><div id="fill"></div></div>
+    <div id="prog" class="stat"></div>
+  </section>
+
+  <section>
+    <h2>3️⃣ 训练日志</h2>
+    <pre id="log">尚未开始训练</pre>
+  </section>
+
+  <section id="doneSec" style="display:none">
+    <h2>4️⃣ 训练完成 🎉</h2>
+    <div id="result" class="stat"></div>
+    <img id="curve" alt="">
+    <p class="hint">已自动把首页的检测模型切换为你的自定义模型。回到<a href="/">首页</a>上传图片试试!</p>
+  </section>
+
+</main>
+<script>
+/* ══════════ 训练页核心逻辑 ══════════
+   流程:点「开始训练」POST /api/train/start(后端起线程训练,立即返回)
+        → setInterval 每 3~5 秒轮询 /api/train/status
+        → 用返回的 progress 刷进度条、log 刷日志、map50 显示准确率
+        → done=true 时展示训练曲线图(/api/train/curve) */
+let timer = null;
+const $ = id => document.getElementById(id);
+
+async function loadStats() {
+  const d = await (await fetch('/api/train/status')).json();
+  $('stats').textContent = `共 ${d.total} 张图片,已标注 ${d.labeled} 张,类别: ${d.classes.join(', ') || '(未设置)'}`;
+}
+
+async function poll() {
+  const d = await (await fetch('/api/train/status')).json();
+  $('stats').textContent = `共 ${d.total} 张图片,已标注 ${d.labeled} 张,类别: ${d.classes.join(', ') || '(未设置)'}`;
+  if (d.running) {
+    $('start').disabled = true; $('stop').style.display = '';
+    $('prog').textContent = `训练中:第 ${d.epoch}/${d.epochs} 轮`;
+    $('fill').style.width = (d.progress * 100).toFixed(1) + '%';
+  } else if (d.done) {
+    clearInterval(timer); timer = null;
+    $('start').disabled = false; $('stop').style.display = 'none';
+    $('fill').style.width = '100%';
+    $('prog').textContent = '训练完成';
+    $('doneSec').style.display = '';
+    $('result').textContent = `最终 mAP50: ${(d.map50*100).toFixed(1)}% — ${(d.map50*100|0) > 60 ? '效果不错!' : 'mAP 偏低,可以多标注些图片再训练。'}`;
+    $('curve').src = '/api/train/curve?' + Date.now();
+  } else {
+    $('start').disabled = false; $('stop').style.display = 'none';
+    if (d.progress) $('prog').textContent = '已停止 / 未完成';
+  }
+  if (d.log) { $('log').textContent = d.log; }
+}
+
+$('start').onclick = async () => {
+  if (confirm('确认开始训练?电脑将满负荷运行一段时间。')) {
+    await fetch('/api/train/start', { method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ epochs: +$('epochs').value, imgsz: +$('imgsz').value }) });
+    if (!timer) timer = setInterval(poll, 3000);
+    poll();
+  }
+};
+$('stop').onclick = async () => {
+  await fetch('/api/train/stop', { method: 'POST' });
+  setTimeout(poll, 1500);
+};
+
+loadStats(); poll();
+if (!timer) timer = setInterval(poll, 5000);
+</script>
+</body>
+</html>

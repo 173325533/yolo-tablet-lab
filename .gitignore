@@ -1,0 +1,22 @@
+# 训练产物和模型权重(体积大,不适合进 git)
+models/
+runs/
+
+# 数据集(图片多、体积大;classes.json 和标注格式说明可按需放开)
+dataset/images/
+dataset/labels/
+dataset/train/
+dataset/val/
+static/uploads/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 系统文件
+Thumbs.db
+.DS_Store
+
+# 预训练权重(首次运行会自动下载)
+*.pt

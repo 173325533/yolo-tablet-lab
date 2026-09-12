@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YOLO 协同学习平台</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f5f6fa; color: #222; }
+  header { background: #1a1c2e; color: #fff; padding: 16px 20px; }
+  header h1 { margin: 0; font-size: 1.3rem; }
+  header p { margin: 4px 0 0; font-size: .8rem; opacity: .7; }
+  main { max-width: 900px; margin: 0 auto; padding: 16px; }
+  section { background: #fff; border-radius: 12px; padding: 16px; margin-bottom: 16px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+  h2 { margin: 0 0 12px; font-size: 1.05rem; border-left: 4px solid #5b7cfa; padding-left: 8px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  button, label.btn { background: #5b7cfa; color: #fff; border: 0; border-radius: 8px;
+         padding: 10px 18px; font-size: 1rem; cursor: pointer; }
+  button.gray { background: #8892a6; }
+  #result { max-width: 100%; margin-top: 12px; border-radius: 8px; }
+  .tags { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag { background: #e8ecff; color: #3450c0; border-radius: 20px; padding: 4px 12px; font-size: .85rem; }
+  .stat { font-size: .85rem; color: #666; margin-top: 6px; }
+  #video { width: 100%; border-radius: 8px; background: #000; }
+  input[type=file] { display: none; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  td, th { border: 1px solid #e0e0e0; padding: 6px 10px; text-align: left; }
+  .hint { font-size: .8rem; color: #999; }
+</style>
+</head>
+<body>
+<header>
+  <h1>YOLO 平板-电脑协同学习平台</h1>
+  <p>推理在这台电脑上运行(CPU),你的平板只是浏览器客户端</p>
+  <p style="margin-top:6px">
+    <a href="/annotate" style="color:#9db4ff">✏️ 数据标注</a> &nbsp;|&nbsp;
+    <a href="/train" style="color:#9db4ff">🏋️ 训练模型</a>
+  </p>
+</header>
+<main>
+
+  <section>
+    <h2>📸 图片检测(平板拍照/相册上传)</h2>
+    <div class="row">
+      <label class="btn">选择图片<input type="file" id="file" accept="image/*"></label>
+      <button id="go" disabled>开始检测</button>
+      <span id="status" class="hint"></span>
+    </div>
+    <div id="tags" class="tags"></div>
+    <img id="result" alt="">
+  </section>
+
+  <section>
+    <h2>🎥 电脑摄像头实时检测</h2>
+    <p class="hint">打开下面的画面,拿着物体在电脑摄像头前移动,平板上实时看到检测框。</p>
+    <div class="row">
+      <button onclick="document.getElementById('video').src='/video'; this.disabled=true">打开实时画面</button>
+    </div>
+    <img id="video" alt="">
+  </section>
+
+  <section>
+    <h2>📚 YOLO 是什么?</h2>
+    <p>YOLO(You Only Look Once)把目标检测变成<b>一次</b>神经网络前向推理:输入一张图,直接输出所有目标的位置框和类别,所以速度很快,适合实时检测。</p>
+    <table>
+      <tr><th>输出框上的数字</th><td>类别名 + 置信度(0~1),如 <code>person 0.92</code> 表示 92% 认为是人</td></tr>
+      <tr><th>conf 阈值</th><td>低于该置信度的框会被过滤,本服务设为 0.4</td></tr>
+      <tr><th>模型版本</th><td>yolo11n(n=nano,最小最快)。还有 s/m/l/x 更准但更慢</td></tr>
+      <tr><th>COCO 80 类</th><td>预训练模型认识 80 种常见物体:人、车、猫、狗、手机、瓶子等</td></tr>
+    </table>
+  </section>
+
+  <section>
+    <h2>🧪 小实验建议</h2>
+    <ul>
+      <li>同一个画面里放多个物体,观察 YOLO 能否同时识别</li>
+      <li>遮挡物体一半,看置信度如何变化</li>
+      <li>对比手机拍照上传 vs 摄像头实时的检测速度差异</li>
+      <li>修改 app.py 里的 <code>conf=0.4</code> 为 0.1 或 0.7,重启后对比结果</li>
+    </ul>
+  </section>
+
+</main>
+<script>
+/* ══════════ 首页检测逻辑 ══════════
+   流程:选图片 → FormData 打包 POST /api/detect
+        → 后端:压缩→YOLO 推理→画框→JPEG 转 base64
+        → 前端:base64 直接塞进 <img>.src 显示,并统计各物体数量
+   实时画面无需 JS:<img>.src 指向 /video 即持续接收 MJPEG 流 */
+const file = document.getElementById('file');
+const go = document.getElementById('go');
+file.onchange = () => go.disabled = !file.files.length;
+go.onclick = async () => {
+  const fd = new FormData();
+  fd.append('image', file.files[0]);
+  go.disabled = true;
+  document.getElementById('status').textContent = '检测中(CPU 约需几秒)...';
+  const r = await fetch('/detect', { method: 'POST', body: fd });
+  const d = await r.json();
+  go.disabled = false;
+  document.getElementById('status').textContent = '';
+  if (d.error) { alert(d.error); return; }
+  document.getElementById('result').src = d.image;
+  const counts = {};
+  d.objects.forEach(o => counts[o.class] = (counts[o.class] || 0) + 1);
+  document.getElementById('tags').innerHTML =
+    Object.entries(counts).map(([k, v]) => `<span class="tag">${k} × ${v}</span>`).join('')
+    + `<span class="tag">耗时 ${d.seconds}s</span>`;
+};
+</script>
+</body>
+</html>

@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>数据标注 - YOLO 学习平台</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f5f6fa; color: #222; }
+  header { background: #1a1c2e; color: #fff; padding: 12px 20px; display: flex;
+           justify-content: space-between; align-items: center; }
+  header a { color: #9db4ff; text-decoration: none; font-size: .9rem; }
+  main { max-width: 1000px; margin: 0 auto; padding: 14px; }
+  section { background: #fff; border-radius: 12px; padding: 14px; margin-bottom: 14px;
+            box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+  h2 { margin: 0 0 10px; font-size: 1rem; border-left: 4px solid #5b7cfa; padding-left: 8px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  button, label.btn { background: #5b7cfa; color: #fff; border: 0; border-radius: 8px;
+         padding: 9px 16px; font-size: .95rem; cursor: pointer; }
+  button.gray { background: #8892a6; }
+  button.red { background: #e05b5b; }
+  input[type=file] { display: none; }
+  #stage { position: relative; margin-top: 10px; touch-action: none; }
+  #img { max-width: 100%; border-radius: 8px; display: block; }
+  #canvas { position: absolute; left: 0; top: 0; }
+  .hint { font-size: .8rem; color: #999; }
+  .thumbs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .thumbs img { width: 84px; height: 84px; object-fit: cover; border-radius: 8px;
+                border: 3px solid transparent; cursor: pointer; }
+  .thumbs img.done { border-color: #38b26a; }
+  .thumbs img.cur { border-color: #5b7cfa; }
+  select, input[type=text] { padding: 8px; border-radius: 8px; border: 1px solid #ccc;
+                             font-size: .95rem; }
+  .objlist { margin-top: 8px; font-size: .85rem; }
+  .objlist span { background: #e8ecff; border-radius: 16px; padding: 3px 10px;
+                  margin: 2px; display: inline-block; }
+</style>
+</head>
+<body>
+<header>
+  <b>✏️ 数据标注</b>
+  <a href="/">← 返回首页</a>
+</header>
+<main>
+
+  <section>
+    <h2>1️⃣ 上传要标注的图片(建议每类 30 张以上)</h2>
+    <div class="row">
+      <label class="btn">添加图片(可多选)<input type="file" id="files" accept="image/*" multiple></label>
+      <span id="upstat" class="hint"></span>
+    </div>
+    <div id="thumbs" class="thumbs"></div>
+  </section>
+
+  <section>
+    <h2>2️⃣ 设置类别(逗号分隔,顺序即编号)</h2>
+    <input type="text" id="classes" style="width:100%" placeholder="例如: cat,dog,cup">
+    <button id="savecls" style="margin-top:8px">保存类别</button>
+    <span id="clsstat" class="hint"></span>
+  </section>
+
+  <section>
+    <h2>3️⃣ 画框标注</h2>
+    <p class="hint">先选类别,然后在图片上<b>按住拖动</b>画出目标框。画错点「删除最后一个框」或「清空」。</p>
+    <div class="row">
+      <select id="curcls"></select>
+      <button class="gray" id="undo">删除最后一个框</button>
+      <button class="red" id="clear">清空本图</button>
+      <button id="save" disabled>✔ 保存本图标注</button>
+      <button class="gray" id="next" disabled>下一张 →</button>
+    </div>
+    <div id="stage">
+      <img id="img" alt="先在上方选择一张图片">
+      <canvas id="canvas"></canvas>
+    </div>
+    <div id="objlist" class="objlist"></div>
+  </section>
+
+</main>
+<script>
+/* ══════════ 标注页核心逻辑 ══════════
+   数据流:上传图片(/api/upload) → 缩略图列表 → 点缩略图载入大图
+        → 在 <canvas> 上拖动画框(记录 0~1 归一化坐标)
+        → 「保存本图标注」(/api/label,后端转成 YOLO 格式 .txt)
+
+   事件模型(兼容平板触屏 + 电脑鼠标):
+     down 按下记起点 → move 拖动实时预览 → up 松手定框
+     e.touches 存在说明是触屏事件,取第一个触点即可 */
+
+let images = [];          // 所有已上传图片 [{name, labeled}]
+let cur = -1;             // 当前编辑的图片下标
+let boxes = [];           // 当前图片的框 [{x,y,w,h,cls}] 归一化坐标
+let classes = [];         // 类别名列表,下标即类别编号
+let drag = null;          // 拖动中的临时框,松手时若足够大才入列
+
+const $ = id => document.getElementById(id);
+
+async function refresh() {
+  const r = await fetch('/api/images'); const d = await r.json();
+  images = d.images;
+  const cls = await fetch('/api/classes'); classes = (await cls.json()).classes;
+  $('classes').value = classes.join(',');
+  renderThumbs(); renderClsSelect();
+}
+
+function renderThumbs() {
+  $('thumbs').innerHTML = images.map((im, i) =>
+    `<img src="/dataset/${im.name}" class="${im.labeled?'done':''} ${i===cur?'cur':''}"
+          onclick="loadImg(${i})">`).join('');
+}
+
+function renderClsSelect() {
+  $('curcls').innerHTML = classes.map(c => `<option>${c}</option>`).join('');
+}
+
+async function loadImg(i) {
+  if (cur >= 0 && boxes.length && !confirm('切换图片将丢失未保存的框,继续?')) return;
+  cur = i; boxes = [];
+  const img = $('img');
+  img.src = '/dataset/' + images[i].name;
+  await img.decode();
+  const c = $('canvas');
+  c.width = img.naturalWidth; c.height = img.naturalHeight;
+  const s = img.clientWidth / img.naturalWidth;
+  c.style.width = img.clientWidth + 'px'; c.style.height = img.clientHeight + 'px';
+  draw(); renderThumbs();
+  $('save').disabled = $('next').disabled = false;
+}
+
+function draw() {
+  const c = $('canvas'), ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  const colors = ['#e05b5b','#38b26a','#5b7cfa','#d78f2b','#9b59b6','#2ba9a0'];
+  const all = [...boxes]; if (drag) all.push(drag);
+  all.forEach(b => {
+    ctx.strokeStyle = colors[b.cls % colors.length]; ctx.lineWidth = 3;
+    ctx.strokeRect(b.x*c.width, b.y*c.height, b.w*c.width, b.h*c.height);
+    ctx.fillStyle = colors[b.cls % colors.length];
+    ctx.font = 'bold 28px sans-serif';
+    ctx.fillText(classes[b.cls], b.x*c.width + 4, Math.max(30, b.y*c.height + 30));
+  });
+  $('objlist').innerHTML = boxes.map(b =>
+    `<span>${classes[b.cls]}</span>`).join('') || '<span class="hint">还没有框</span>';
+}
+
+function pos(e) {
+  const r = $('canvas').getBoundingClientRect();
+  const t = e.touches ? e.touches[0] : e;
+  return { x: (t.clientX - r.left) / r.width, y: (t.clientY - r.top) / r.height };
+}
+
+function down(e) { e.preventDefault();
+  if (!classes.length) { alert('请先设置类别'); return; }
+  const p = pos(e); drag = { x: p.x, y: p.y, w: 0, h: 0, cls: $('curcls').selectedIndex };
+}
+function move(e) { e.preventDefault(); if (!drag) return;
+  const p = pos(e);
+  drag.w = p.x - drag.x; drag.h = p.y - drag.y; draw();
+}
+function up() { if (!drag) return;
+  if (Math.abs(drag.w) > 0.01 && Math.abs(drag.h) > 0.01) {
+    boxes.push({ x: Math.min(drag.x, drag.x+drag.w), y: Math.min(drag.y, drag.y+drag.h),
+                 w: Math.abs(drag.w), h: Math.abs(drag.h), cls: drag.cls });
+  }
+  drag = null; draw();
+}
+const c = $('canvas');
+c.addEventListener('mousedown', down); c.addEventListener('mousemove', move);
+c.addEventListener('mouseup', up);
+c.addEventListener('touchstart', down, {passive:false});
+c.addEventListener('touchmove', move, {passive:false});
+c.addEventListener('touchend', up);
+
+$('undo').onclick = () => { boxes.pop(); draw(); };
+$('clear').onclick = () => { boxes = []; draw(); };
+$('next').onclick = () => { const n = images.findIndex((im,i)=>i>cur && !im.labeled);
+  loadImg(n > 0 ? n : 0); };
+
+$('files').onchange = async () => {
+  const fd = new FormData();
+  [...$('files').files].forEach(f => fd.append('files', f));
+  $('upstat').textContent = '上传中...';
+  const r = await fetch('/api/upload', { method: 'POST', body: fd });
+  const d = await r.json();
+  $('upstat').textContent = `已上传 ${d.saved} 张(重复 ${d.skipped})`;
+  await refresh(); loadImg(images.length ? images.length - 1 : 0);
+};
+
+$('savecls').onclick = async () => {
+  classes = $('classes').value.split(/[,，]/).map(s=>s.trim()).filter(Boolean);
+  await fetch('/api/classes', { method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({classes}) });
+  $('clsstat').textContent = '已保存:' + classes.join(', ');
+  renderClsSelect();
+};
+
+$('save').onclick = async () => {
+  if (cur < 0) return;
+  await fetch('/api/label', { method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ name: images[cur].name, boxes }) });
+  images[cur].labeled = boxes.length > 0;
+  renderThumbs();
+  alert('已保存 ' + boxes.length + ' 个框');
+};
+
+refresh();
+</script>
+</body>
+</html>
