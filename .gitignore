@@ -20,3 +20,8 @@ Thumbs.db
 
 # 预训练权重(首次运行会自动下载)
 *.pt
+
+# 本地杂项
+*.bak
+dataset/data.yaml
+*.onnx

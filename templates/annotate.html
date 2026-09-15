@@ -61,12 +61,14 @@
   </section>
 
   <section>
-    <h2>3️⃣ 画框标注</h2>
-    <p class="hint">先选类别,然后在图片上<b>按住拖动</b>画出目标框。画错点「删除最后一个框」或「清空」。</p>
+    <h2>3️⃣ 画框 / 描多边形标注</h2>
+    <p class="hint">分割测量需要<b>多边形标注</b>:选类别后沿物体边缘逐点点击,点完按「闭合多边形」。框模式只适合快速粗标。</p>
     <div class="row">
+      <select id="mode"><option value="poly">🔷 多边形(推荐,可测面积/直径)</option><option value="rect">▭ 矩形框</option></select>
       <select id="curcls"></select>
-      <button class="gray" id="undo">删除最后一个框</button>
+      <button class="gray" id="undo">撤销</button>
       <button class="red" id="clear">清空本图</button>
+      <button id="closePoly" style="display:none">闭合多边形 ✔</button>
       <button id="save" disabled>✔ 保存本图标注</button>
       <button class="gray" id="next" disabled>下一张 →</button>
     </div>
@@ -80,19 +82,22 @@
 </main>
 <script>
 /* ══════════ 标注页核心逻辑 ══════════
-   数据流:上传图片(/api/upload) → 缩略图列表 → 点缩略图载入大图
-        → 在 <canvas> 上拖动画框(记录 0~1 归一化坐标)
-        → 「保存本图标注」(/api/label,后端转成 YOLO 格式 .txt)
+   两种标注模式(下拉切换):
+     rect  按下拖动画框     → up 时存 {cls,x,y,w,h}
+     poly  逐点点击描轮廓   → ≥3 点后「闭合多边形」存 {cls,poly:[[x,y],...]}
+   后端统一把两种都写成 YOLO-seg 多边形格式(cls x1 y1 x2 y2 ...)
 
    事件模型(兼容平板触屏 + 电脑鼠标):
-     down 按下记起点 → move 拖动实时预览 → up 松手定框
-     e.touches 存在说明是触屏事件,取第一个触点即可 */
+     rect: down 记起点 → move 预览 → up 定框
+     poly: click 逐点加入;双击 = 闭合
+     e.touches 存在说明是触屏事件,取第一个触点 */
 
 let images = [];          // 所有已上传图片 [{name, labeled}]
 let cur = -1;             // 当前编辑的图片下标
-let boxes = [];           // 当前图片的框 [{x,y,w,h,cls}] 归一化坐标
+let shapes = [];          // 当前图的标注 {cls, x,y,w,h} 或 {cls, poly:[[x,y]...]}
 let classes = [];         // 类别名列表,下标即类别编号
-let drag = null;          // 拖动中的临时框,松手时若足够大才入列
+let drag = null;          // rect 拖动中的临时框
+let curPoly = null;       // poly 进行中的临时多边形(点数组)
 
 const $ = id => document.getElementById(id);
 
@@ -115,33 +120,48 @@ function renderClsSelect() {
 }
 
 async function loadImg(i) {
-  if (cur >= 0 && boxes.length && !confirm('切换图片将丢失未保存的框,继续?')) return;
-  cur = i; boxes = [];
+  if (cur >= 0 && shapes.length && !confirm('切换图片将丢失未保存的标注,继续?')) return;
+  cur = i; shapes = []; curPoly = null; drag = null;
   const img = $('img');
   img.src = '/dataset/' + images[i].name;
   await img.decode();
   const c = $('canvas');
   c.width = img.naturalWidth; c.height = img.naturalHeight;
-  const s = img.clientWidth / img.naturalWidth;
   c.style.width = img.clientWidth + 'px'; c.style.height = img.clientHeight + 'px';
   draw(); renderThumbs();
   $('save').disabled = $('next').disabled = false;
 }
 
+function mode() { return $('mode').value; }
+
 function draw() {
   const c = $('canvas'), ctx = c.getContext('2d');
   ctx.clearRect(0, 0, c.width, c.height);
   const colors = ['#e05b5b','#38b26a','#5b7cfa','#d78f2b','#9b59b6','#2ba9a0'];
-  const all = [...boxes]; if (drag) all.push(drag);
+  const all = [...shapes];
+  if (drag) all.push(drag);
+  if (curPoly) all.push({cls: $('curcls').selectedIndex, poly: curPoly, preview: true});
   all.forEach(b => {
-    ctx.strokeStyle = colors[b.cls % colors.length]; ctx.lineWidth = 3;
-    ctx.strokeRect(b.x*c.width, b.y*c.height, b.w*c.width, b.h*c.height);
-    ctx.fillStyle = colors[b.cls % colors.length];
-    ctx.font = 'bold 28px sans-serif';
-    ctx.fillText(classes[b.cls], b.x*c.width + 4, Math.max(30, b.y*c.height + 30));
+    const color = colors[((b.cls % colors.length) + colors.length) % colors.length];
+    ctx.strokeStyle = color; ctx.fillStyle = color; ctx.lineWidth = 3;
+    if (b.poly) {                                  // 多边形:描边 + 顶点圆点
+      ctx.beginPath();
+      b.poly.forEach((p, i) => i ? ctx.lineTo(p[0]*c.width, p[1]*c.height)
+                                 : ctx.moveTo(p[0]*c.width, p[1]*c.height));
+      if (!b.preview && b.poly.length >= 3) ctx.closePath();
+      ctx.stroke();
+      b.poly.forEach(p => { ctx.beginPath();
+        ctx.arc(p[0]*c.width, p[1]*c.height, 5, 0, 7); ctx.fill(); });
+    } else {                                       // 矩形框
+      ctx.strokeRect(b.x*c.width, b.y*c.height, b.w*c.width, b.h*c.height);
+      ctx.font = 'bold 28px sans-serif';
+      ctx.fillText(classes[b.cls], b.x*c.width + 4, Math.max(30, b.y*c.height + 30));
+    }
   });
-  $('objlist').innerHTML = boxes.map(b =>
-    `<span>${classes[b.cls]}</span>`).join('') || '<span class="hint">还没有框</span>';
+  $('objlist').innerHTML = shapes.map(b =>
+    `<span>${classes[b.cls]}</span>`).join('') || '<span class="hint">还没有标注</span>';
+  $('closePoly').style.display =
+    (mode() === 'poly' && curPoly && curPoly.length >= 3) ? '' : 'none';
 }
 
 function pos(e) {
@@ -150,30 +170,60 @@ function pos(e) {
   return { x: (t.clientX - r.left) / r.width, y: (t.clientY - r.top) / r.height };
 }
 
-function down(e) { e.preventDefault();
+/* ── 矩形模式:按下拖动 ── */
+function down(e) {
+  if (mode() !== 'rect') return;                   // 多边形模式用 click,不走这里
+  e.preventDefault();
   if (!classes.length) { alert('请先设置类别'); return; }
   const p = pos(e); drag = { x: p.x, y: p.y, w: 0, h: 0, cls: $('curcls').selectedIndex };
 }
-function move(e) { e.preventDefault(); if (!drag) return;
+function move(e) { if (mode() !== 'rect' || !drag) return; e.preventDefault();
   const p = pos(e);
-  drag.w = p.x - drag.x; drag.h = p.y - drag.y; draw();
+  drag.w = p.x - drag.x; drag.h = p.y - drag.h; draw();
 }
-function up() { if (!drag) return;
+function up() {
+  if (mode() !== 'rect') return;
+  if (!drag) return;
   if (Math.abs(drag.w) > 0.01 && Math.abs(drag.h) > 0.01) {
-    boxes.push({ x: Math.min(drag.x, drag.x+drag.w), y: Math.min(drag.y, drag.y+drag.h),
-                 w: Math.abs(drag.w), h: Math.abs(drag.h), cls: drag.cls });
+    shapes.push({ x: Math.min(drag.x, drag.x+drag.w), y: Math.min(drag.y, drag.y+drag.h),
+                  w: Math.abs(drag.w), h: Math.abs(drag.h), cls: drag.cls });
   }
   drag = null; draw();
 }
+
+/* ── 多边形模式:逐点点击,≥3 点后闭合 ── */
+function clickAdd(e) {
+  if (mode() !== 'poly') return;
+  if (!classes.length) { alert('请先设置类别'); return; }
+  const p = pos(e);
+  if (!curPoly) curPoly = [];
+  curPoly.push([p.x, p.y]);
+  draw();
+}
+function closePoly() {
+  if (curPoly && curPoly.length >= 3)
+    shapes.push({ cls: $('curcls').selectedIndex, poly: curPoly });
+  curPoly = null; draw();
+}
+
 const c = $('canvas');
 c.addEventListener('mousedown', down); c.addEventListener('mousemove', move);
 c.addEventListener('mouseup', up);
 c.addEventListener('touchstart', down, {passive:false});
 c.addEventListener('touchmove', move, {passive:false});
 c.addEventListener('touchend', up);
+c.addEventListener('click', clickAdd);
+c.addEventListener('dblclick', e => { e.preventDefault();
+  if (mode() === 'poly' && curPoly) { curPoly.splice(-2); closePoly(); } });
+$('closePoly').onclick = closePoly;
+$('mode').onchange = draw;
 
-$('undo').onclick = () => { boxes.pop(); draw(); };
-$('clear').onclick = () => { boxes = []; draw(); };
+$('undo').onclick = () => {
+  if (curPoly && curPoly.length) curPoly.pop();  // 撤销当前多边形的最后一个点
+  else shapes.pop();                             // 否则删除上一个完整标注
+  draw();
+};
+$('clear').onclick = () => { shapes = []; curPoly = null; drag = null; draw(); };
 $('next').onclick = () => { const n = images.findIndex((im,i)=>i>cur && !im.labeled);
   loadImg(n > 0 ? n : 0); };
 
@@ -198,11 +248,14 @@ $('savecls').onclick = async () => {
 
 $('save').onclick = async () => {
   if (cur < 0) return;
+  if (curPoly && curPoly.length >= 3) {          // 有未闭合的多边形,保存前自动闭合
+    shapes.push({ cls: $('curcls').selectedIndex, poly: curPoly }); curPoly = null;
+  }
   await fetch('/api/label', { method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ name: images[cur].name, boxes }) });
-  images[cur].labeled = boxes.length > 0;
+    body: JSON.stringify({ name: images[cur].name, boxes: shapes }) });
+  images[cur].labeled = shapes.length > 0;
   renderThumbs();
-  alert('已保存 ' + boxes.length + ' 个框');
+  alert('已保存 ' + shapes.length + ' 个标注');
 };
 
 refresh();

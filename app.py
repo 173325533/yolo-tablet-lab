@@ -42,6 +42,7 @@
 """
 import base64
 import json
+import math
 import os
 import random
 import re
@@ -49,6 +50,7 @@ import threading
 import time
 
 import cv2
+import numpy as np
 from flask import Flask, Response, render_template, request, jsonify, send_from_directory
 from ultralytics import YOLO
 
@@ -69,12 +71,39 @@ CUSTOM_WEIGHTS = os.path.join(MODELS_DIR, "custom.pt")       # 训练完成后�
 app = Flask(__name__)
 
 # ────────────────────────────────────────────────
-# 二、加载模型
+# 二、加载模型(分割版)
 # ────────────────────────────────────────────────
-# 当前用于检测的模型。启动时加载预训练的 yolo11n(认识 COCO 80 类物体);
-# 训练完成后 run_training() 会把它换成你的自定义模型 custom.pt。
-model = YOLO("yolo11n.pt")
+# yolo11n-seg:除了检测框,还输出每个目标的像素级掩码(mask)。
+# 只有拿到掩码,才能计算 缺陷面积/内外径/焊缝宽度 等几何量。
+model = YOLO("yolo11n-seg.pt")
 model_lock = threading.Lock()  # 推理和"换模型"可能同时发生,加锁防止读到半初始化的模型
+
+
+def migrate_rect_labels():
+    """
+    一次性迁移:旧"框格式"标注(每行5个数:cls cx cy w h)
+    → 分割训练要求的"多边形格式"(cls x1 y1 x2 y2 ...)。
+    框被转成四角多边形(掩码即矩形,精度有限);
+    在标注页用多边形模式重新描过后,测量精度会显著提升。
+    """
+    for fn in os.listdir(LABELS_DIR):
+        if not fn.endswith(".txt"):
+            continue
+        p = os.path.join(LABELS_DIR, fn)
+        lines = [l.split() for l in open(p, encoding="utf-8").read().splitlines() if l.strip()]
+        if not lines or max(len(l) for l in lines) > 5:
+            continue  # 已是多边形格式,不动
+        out = []
+        for l in lines:
+            c, cx, cy, w, h = (float(v) for v in l)
+            x0, y0, x1, y1 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+            out.append(f"{int(c)} {x0:.6f} {y0:.6f} {x1:.6f} {y0:.6f} "
+                       f"{x1:.6f} {y1:.6f} {x0:.6f} {y1:.6f}")
+        open(p, "w", encoding="utf-8").write("\n".join(out))
+        print(f"[迁移] {fn}: 框标注 → 多边形标注")
+
+
+migrate_rect_labels()
 
 
 def load_classes():
@@ -175,16 +204,17 @@ def run_training(epochs, imgsz):
             train_state["epochs"] = trainer.epochs
             train_state["progress"] = (trainer.epoch + 1) / trainer.epochs
             m = trainer.metrics or {}
-            train_state["map50"] = float(m.get("metrics/mAP50(B)", 0))
+            # 分割模型同时输出 框mAP(B) 和 掩码mAP(M),优先看掩码
+            train_state["map50"] = float(m.get("metrics/mAP50(M)",
+                                               m.get("metrics/mAP50(B)", 0)))
             _log(f"epoch {trainer.epoch+1}/{trainer.epochs}  "
-                 f"loss={float(m.get('train/box_loss', 0)):.3f}  "
                  f"mAP50={train_state['map50']:.3f}\n")
 
-        # 重新加载一份干净的预训练模型来训练(不动推理用的 model)
+        # 重新加载一份干净的预训练【分割】模型来训练(不动推理用的 model)
         # device="cpu"    在 CPU 上训练(GPU 电脑可改成 "0")
         # batch=8         每批 8 张图一起算,CPU 内存友好
         # workers=0       Windows 下多进程加载容易出问题,单线程最稳
-        m2 = YOLO("yolo11n.pt")
+        m2 = YOLO("yolo11n-seg.pt")
         m2.add_callback("on_fit_epoch_end", on_epoch)
         results = m2.train(data=data_yaml, epochs=epochs, imgsz=imgsz,
                            device="cpu", batch=8, workers=0, exist_ok=True,
@@ -208,22 +238,78 @@ def run_training(epochs, imgsz):
 # ────────────────────────────────────────────────
 # 四、检测核心函数(图片检测和摄像头共用)
 # ────────────────────────────────────────────────
+def measure_objects(r, mm_per_px=1.0):
+    """
+    从分割结果里提取每个目标的几何量(工业测量核心)。
+
+    原理:r.masks.data 是每个实例的二值掩码张量(低分辨率),
+    放大到原图尺寸后用 cv2.findContours(RETR_CCOMP) 提取轮廓层级:
+      外轮廓 → 物体整体形状;有"父轮廓"的内轮廓 → 孔洞(如杯口)
+    由此得到:
+      面积        掩码像素数 × (mm/px)²       → 缺陷面积
+      外径        外轮廓最小外接圆直径          → 圆形工件外径
+      内径        最大孔洞的等效圆直径          → 俯拍带孔工件内径
+      焊缝宽度    细长掩码的最小外接矩形短边     → 焊缝/划痕宽度
+    mm_per_px 是标定系数:照片里 1 像素代表多少毫米。
+    """
+    out = []
+    if r.masks is None:
+        return out
+    H, W = r.orig_img.shape[:2]
+    for i in range(len(r.masks)):
+        # 掩码放大回原图分辨率(线性插值后 0.5 阈值二值化,边缘更平滑)
+        mk = r.masks.data[i].cpu().numpy().astype(np.float32)
+        mk = cv2.resize(mk, (W, H), interpolation=cv2.INTER_LINEAR)
+        mask = (mk > 0.5).astype(np.uint8) * 255
+        cnts, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if not cnts:
+            continue
+        # 外轮廓 = 没有父轮廓的轮廓中面积最大的那个
+        outer_idx = [j for j in range(len(cnts)) if hier[0][j][3] == -1]
+        if not outer_idx:
+            continue
+        j = max(outer_idx, key=lambda k: cv2.contourArea(cnts[k]))
+        outer = cnts[j]
+        area_px = cv2.contourArea(outer)
+        x, y, w, h = cv2.boundingRect(outer)
+        # 孔洞 = 当前外轮廓的子轮廓
+        holes = [cv2.contourArea(cnts[k]) for k in range(len(cnts))
+                 if hier[0][k][3] == j and cv2.contourArea(cnts[k]) > 30]
+        m = {
+            "class": model.names[int(r.boxes.cls[i])],
+            "conf": round(float(r.boxes.conf[i]), 3),
+            "area_px": round(area_px, 1),
+            "area_mm2": round(area_px * mm_per_px ** 2, 2),
+            "bbox_mm": [round(w * mm_per_px, 1), round(h * mm_per_px, 1)],
+            "eq_diameter_mm": round(2 * math.sqrt(area_px / math.pi) * mm_per_px, 1),
+        }
+        (_, _), radius = cv2.minEnclosingCircle(outer)
+        m["outer_diameter_mm"] = round(2 * radius * mm_per_px, 1)
+        if holes:  # 有孔才谈"内径"
+            m["inner_diameter_mm"] = round(2 * math.sqrt(max(holes) / math.pi) * mm_per_px, 1)
+        if max(w, h) >= 3 * min(w, h):  # 细长形状才当焊缝/划痕测宽度
+            (_, _), (rw, rh), _ = cv2.minAreaRect(outer)
+            m["weld_width_mm"] = round(min(rw, rh) * mm_per_px, 1)
+        out.append(m)
+    return out
+
+
 def draw_detections(frame):
     """
-    输入一帧图像 → YOLO 检测 → 画出框。
-    返回 (画好框的图, 检测结果列表)。
-    结果列表形如 [{"class": "cup", "conf": 0.92}, ...],用于网页上显示文字标签。
+    输入一帧图像 → 分割 → 画框和掩码。
+    返回 (画好框的图, 检测结果列表, 原始 results)。
+    第三项供 measure_objects() 提取掩码做几何测量;视频流场景忽略它即可。
     """
     with model_lock:
         results = model.predict(frame, imgsz=640, conf=0.4, verbose=False)
-    annotated = results[0].plot()          # ultralytics 自带画框(框+类别+置信度)
+    annotated = results[0].plot()          # ultralytics 自带画框+掩码着色
     detected = []
     for box in results[0].boxes:
         detected.append({
             "class": model.names[int(box.cls)],   # 类别名(如 "person")
             "conf": round(float(box.conf), 3),    # 置信度 0~1
         })
-    return annotated, detected
+    return annotated, detected, results
 
 
 # ────────────────────────────────────────────────
@@ -271,8 +357,15 @@ def detect():
     if scale < 1:
         img = cv2.resize(img, (int(w * scale), int(h * scale)))
 
+    # 标定系数:照片里 1 像素 = 多少毫米(在首页输入框设置,不填按 1 处理即只给像素值)。
+    # 注意标定是相对"原始照片"的,若上面压过图要等比折算
+    mm_per_px = float(request.form.get("mm_per_px", 1) or 1)
+    if scale < 1:
+        mm_per_px = mm_per_px / scale
+
     t0 = time.time()
-    annotated, detected = draw_detections(img)
+    annotated, detected, results = draw_detections(img)
+    measurements = measure_objects(results[0], mm_per_px)  # 传单张图的结果对象
     cost = round(time.time() - t0, 2)
 
     # 把结果图编码成 JPEG 再转 base64,直接塞进 JSON 返回;
@@ -282,6 +375,7 @@ def detect():
     return jsonify({
         "image": "data:image/jpeg;base64," + b64,
         "objects": detected,
+        "measurements": measurements,
         "seconds": cost,
     })
 
@@ -311,7 +405,7 @@ def generate_frames():
             if not ok:
                 break
             frame = cv2.resize(frame, (640, 480))
-            annotated, _ = draw_detections(frame)
+            annotated, _, _ = draw_detections(frame)
             ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n")
@@ -374,18 +468,25 @@ def api_classes():
 @app.route("/api/label", methods=["POST"])
 def api_label():
     """
-    保存一张图的标注框。
-    前端传来归一化的左上角+宽高,这里转成 YOLO 要求的"中心点+宽高"格式写入 .txt。
-    坐标换算:x_center = x + w/2 ,y_center = y + h/2。
+    保存一张图的标注,统一写成分割要求的多边形格式:
+      类别编号 x1 y1 x2 y2 x3 y3 ...   (所有坐标 0~1 归一化)
+    前端两种输入都能处理:
+      多边形 {cls, poly:[[x,y],...]}  → 直接按点写入(推荐的标注方式)
+      矩形   {cls, x, y, w, h}       → 转成四角多边形(掩码即矩形)
     """
     d = request.get_json()
     name = os.path.basename(d["name"])  # 只取文件名,防止恶意路径(如 ../../)穿越
-    boxes = d.get("boxes", [])
+    items = d.get("boxes", [])
     lines = []
-    for b in boxes:
-        xc = b["x"] + b["w"] / 2
-        yc = b["y"] + b["h"] / 2
-        lines.append(f'{b["cls"]} {xc:.6f} {yc:.6f} {b["w"]:.6f} {b["h"]:.6f}')
+    for b in items:
+        if "poly" in b and len(b["poly"]) >= 3:
+            pts = " ".join(f"{p[0]:.6f} {p[1]:.6f}" for p in b["poly"])
+            lines.append(f'{b["cls"]} {pts}')
+        elif all(k in b for k in ("x", "y", "w", "h")):
+            x0, y0 = b["x"], b["y"]
+            x1, y1 = b["x"] + b["w"], b["y"] + b["h"]
+            lines.append(f'{b["cls"]} {x0:.6f} {y0:.6f} {x1:.6f} {y0:.6f} '
+                         f'{x1:.6f} {y1:.6f} {x0:.6f} {y1:.6f}')
     with open(os.path.join(LABELS_DIR, os.path.splitext(name)[0] + ".txt"),
               "w", encoding="utf-8") as f:
         f.write("\n".join(lines))

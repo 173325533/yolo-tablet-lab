@@ -43,13 +43,18 @@
 <main>
 
   <section>
-    <h2>📸 图片检测(平板拍照/相册上传)</h2>
+    <h2>📸 图片检测与测量(平板拍照/相册上传)</h2>
     <div class="row">
       <label class="btn">选择图片<input type="file" id="file" accept="image/*"></label>
       <button id="go" disabled>开始检测</button>
+      <label>标定:1像素=<input id="mmpp" type="number" step="0.01" min="0" value="1" style="width:70px">mm</label>
       <span id="status" class="hint"></span>
     </div>
+    <p class="hint">标定方法:拍摄时在被测平面放一把尺子,量出尺子上 N mm 对应照片里多少像素,N ÷ 像素数 就是每像素毫米数。不标定则面积按像素、直径按像素显示。</p>
     <div id="tags" class="tags"></div>
+    <table id="mtable" style="display:none;margin-top:8px"><thead>
+      <tr><th>类别</th><th>置信度</th><th>面积</th><th>外径</th><th>内径</th><th>焊缝宽</th></tr>
+    </thead><tbody></tbody></table>
     <img id="result" alt="">
   </section>
 
@@ -64,12 +69,12 @@
 
   <section>
     <h2>📚 YOLO 是什么?</h2>
-    <p>YOLO(You Only Look Once)把目标检测变成<b>一次</b>神经网络前向推理:输入一张图,直接输出所有目标的位置框和类别,所以速度很快,适合实时检测。</p>
+    <p>YOLO(You Only Look Once)把目标检测变成<b>一次</b>神经网络前向推理:输入一张图,直接输出所有目标的位置和类别。本平台用的是 <b>yolo11n-seg 分割版</b>:除检测框外还给每个目标输出像素级掩码,掩码可用于计算<b>面积、内外径、焊缝宽度</b>等几何量。</p>
     <table>
       <tr><th>输出框上的数字</th><td>类别名 + 置信度(0~1),如 <code>person 0.92</code> 表示 92% 认为是人</td></tr>
       <tr><th>conf 阈值</th><td>低于该置信度的框会被过滤,本服务设为 0.4</td></tr>
-      <tr><th>模型版本</th><td>yolo11n(n=nano,最小最快)。还有 s/m/l/x 更准但更慢</td></tr>
-      <tr><th>COCO 80 类</th><td>预训练模型认识 80 种常见物体:人、车、猫、狗、手机、瓶子等</td></tr>
+      <tr><th>模型版本</th><td>yolo11n-seg(n=nano,最小最快)。还有 s/m/l/x 更准但更慢</td></tr>
+      <tr><th>测量原理</th><td>掩码外轮廓→外径/面积;内部孔洞→内径;细长掩码短边→焊缝宽度。需在输入框填「每像素多少毫米」标定</td></tr>
     </table>
   </section>
 
@@ -96,6 +101,7 @@ file.onchange = () => go.disabled = !file.files.length;
 go.onclick = async () => {
   const fd = new FormData();
   fd.append('image', file.files[0]);
+  fd.append('mm_per_px', document.getElementById('mmpp').value || 1);
   go.disabled = true;
   document.getElementById('status').textContent = '检测中(CPU 约需几秒)...';
   const r = await fetch('/detect', { method: 'POST', body: fd });
@@ -109,6 +115,18 @@ go.onclick = async () => {
   document.getElementById('tags').innerHTML =
     Object.entries(counts).map(([k, v]) => `<span class="tag">${k} × ${v}</span>`).join('')
     + `<span class="tag">耗时 ${d.seconds}s</span>`;
+  /* 测量表:每个目标一列,面积为 mm²(未标定时显示 px²),直径/宽度 mm */
+  const tb = document.querySelector('#mtable tbody');
+  const ms = d.measurements || [];
+  document.getElementById('mtable').style.display = ms.length ? '' : 'none';
+  tb.innerHTML = ms.map(m => {
+    const u = m.area_mm2 && (document.getElementById('mmpp').value != 1) ? 'mm²' : 'px²';
+    return `<tr><td>${m.class}</td><td>${m.conf}</td>` +
+      `<td>${m.area_mm2} ${u}</td>` +
+      `<td>${m.outer_diameter_mm != null ? m.outer_diameter_mm + ' mm' : '—'}</td>` +
+      `<td>${m.inner_diameter_mm != null ? m.inner_diameter_mm + ' mm' : '—'}</td>` +
+      `<td>${m.weld_width_mm != null ? m.weld_width_mm + ' mm' : '—'}</td></tr>`;
+  }).join('');
 };
 </script>
 </body>
