@@ -1,23 +1,25 @@
 # -*- coding: utf-8 -*-
 """
 ═══════════════════════════════════════════════════════════════════
- YOLO 平板-电脑协同学习平台 —— 服务端主程序
+ YOLO 平板-电脑协同学习平台(分割测量版) —— 服务端主程序
 ═══════════════════════════════════════════════════════════════════
 
 【整体架构】
   平板(浏览器,只负责显示和交互)
       │  同一 WiFi 局域网
       ▼
-  这台电脑运行本程序(Flask Web 服务 + YOLO 推理/训练)
+  这台电脑运行本程序(Flask Web 服务 + YOLO 分割推理/训练 + 几何测量)
 
 【请求处理流程】
-  1. 平板访问 http://<电脑IP>:8000/          → 返回首页(推理演示)
-  2. 平板访问 /annotate                       → 返回标注页面
+  1. 平板访问 http://<电脑IP>:8000/          → 返回首页(检测+测量)
+  2. 平板访问 /annotate                       → 返回标注页面(矩形/多边形)
   3. 平板访问 /train                          → 返回训练页面
-  4. 图片检测:浏览器 JS 调 /detect           → 本程序调 YOLO → 返回画好框的图
+  4. 图片检测:浏览器 JS 调 /detect           → 分割推理 → 返回画好掩码的图
+     + 测量表(面积/外径/内径/焊缝宽,支持 mm 标定)
   5. 实时画面:浏览器 <img> 连 /video         → 持续推送摄像头检测帧(MJPEG 流)
   6. 标注:浏览器 JS 调 /api/upload /api/label → 存入 dataset/ 目录
-  7. 训练:浏览器 JS 调 /api/train/start      → 后台线程跑 YOLO 训练,
+     GET /api/label/<图片名> 回显已保存标注
+  7. 训练:浏览器 JS 调 /api/train/start      → 后台线程跑 YOLO-seg 训练,
      浏览器轮询 /api/train/status 显示进度
 
 【目录结构】
@@ -28,17 +30,24 @@
   ├── models/           ← 训练产出的自定义权重 custom.pt
   └── dataset/          ← 标注数据集
       ├── images/       原始上传图片
-      ├── labels/       每张图的 YOLO 格式标注(同名 .txt)
+      ├── labels/       每张图的 YOLO 分割标注(同名 .txt)
       ├── classes.json  类别名单(顺序即编号)
       ├── data.yaml     训练时自动生成的 ultralytics 配置
       ├── train/        训练时自动划分:训练集(80%)
       └── val/          训练时自动划分:验证集(20%)
 
-【YOLO 标注格式说明】(labels/*.txt 每行一个框)
-  类别编号 中心x 中心y 宽 高
+【模型说明】
+  推理与训练均使用 yolo11n-seg(分割版):
+  除检测框外还输出每个目标的像素级掩码(mask),
+  measure_objects() 用掩码计算 面积/外径/内径/焊缝宽度 等几何量。
+
+【YOLO 分割标注格式】(labels/*.txt 每行一个目标)
+  类别编号 x1 y1 x2 y2 x3 y3 ...   (沿目标边缘的多个顶点)
   所有坐标都是 0~1 的比例值(除以图片宽高),与图片尺寸无关。
-  例:0 0.250000 0.400000 0.300000 0.400000
-  = 0 号类别的框,中心在图宽 25%、图高 40% 处,宽 30%、高 40%。
+  例:0 0.10 0.10 0.50 0.10 0.50 0.60 0.20 0.70
+  = 0 号目标的多边形轮廓,共 4 个顶点。
+  启动时 migrate_rect_labels() 会把旧版矩形标注(每行5个数)
+  自动迁移成四角多边形。
 """
 import base64
 import json
@@ -463,6 +472,30 @@ def api_classes():
         cls = request.get_json().get("classes", [])
         save_classes([str(c) for c in cls])
     return jsonify({"classes": load_classes()})
+
+
+@app.route("/api/label/<name>")
+def api_get_label(name):
+    """
+    读取一张图已保存的标注,返回给标注页回显。
+    .txt 里统一是多边形格式(cls x1 y1 x2 y2 ...),但也兼容旧框格式(5 个数)。
+    """
+    name = os.path.basename(name)
+    p = os.path.join(LABELS_DIR, os.path.splitext(name)[0] + ".txt")
+    if not os.path.exists(p):
+        return jsonify({"shapes": []})
+    shapes = []
+    for line in open(p, encoding="utf-8").read().splitlines():
+        if not line.strip():
+            continue
+        v = line.split()
+        if len(v) >= 7:                     # 多边形:类号 + 至少 3 个点
+            pts = [[float(v[i]), float(v[i + 1])] for i in range(1, len(v) - 1, 2)]
+            shapes.append({"cls": int(float(v[0])), "poly": pts})
+        elif len(v) == 5:                   # 旧框格式:转回左上角+宽高供画布画矩形
+            c, cx, cy, w, h = map(float, v)
+            shapes.append({"cls": int(c), "x": cx - w / 2, "y": cy - h / 2, "w": w, "h": h})
+    return jsonify({"shapes": shapes})
 
 
 @app.route("/api/label", methods=["POST"])

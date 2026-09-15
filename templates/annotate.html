@@ -128,6 +128,9 @@ async function loadImg(i) {
   const c = $('canvas');
   c.width = img.naturalWidth; c.height = img.naturalHeight;
   c.style.width = img.clientWidth + 'px'; c.style.height = img.clientHeight + 'px';
+  // 回显:把这张图已保存的标注读回来画到画布上
+  const lr = await fetch('/api/label/' + encodeURIComponent(images[i].name));
+  shapes = (await lr.json()).shapes || [];
   draw(); renderThumbs();
   $('save').disabled = $('next').disabled = false;
 }
